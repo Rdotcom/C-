@@ -27,6 +27,7 @@ pico_add_extra_outputs(${PROJECT_NAME})
 # Link with necessary libraries
 target_link_libraries(${PROJECT_NAME}
         pico_stdlib
+        pico_stdio
         hardware_pwm
         hardware_gpio
         hardware_i2c
