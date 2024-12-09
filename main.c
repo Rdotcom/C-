@@ -1,181 +1,293 @@
 #include <stdio.h>
-#include <string.h>
 #include "pico/stdlib.h"
+#include "hardware/pwm.h"
 #include "hardware/uart.h"
+#include "hardware/i2c.h"
+#include "hardware/gpio.h"
+#include <stdbool.h>
+#include <string.h>
+#include <ctype.h>
+#include <stdlib.h>
 
-#define BAUD_RATE 9600
-#define UART_TX_PIN 0  // UART TX pin
-#define UART_RX_PIN 1  // UART RX pin
-#define STRLEN 80
-#define RESPONSE_TIMEOUT_MS 2000  // Increased timeout for receiving response in milliseconds
-#define MAX_ATTEMPTS 5           // Maximum retry attempts for "AT" command
-#define COMMAND_DELAY_MS 1000     // Delay between commands
+// TODO: Led blinks while waiting in all possible states (waiting room)
+// Check if leds really blinks 5 times (pill dispense)
+// TODO+ Device remembers state even if reset
+// Device connected to Lorawan and sends logs when status is changed
 
-// Function to send commands to LoRa module
-void send_lora_command(const char *cmd) {
-    uart_puts(uart0, cmd);
-    uart_puts(uart0, "\r\n");  // Append carriage return and newline
-    printf("Sent: %s\n", cmd); // Log sent command
+#define OPTO_PIN 28 // Optical sensor pin
+#define PIEZO_PIN 27 // Pill drop sensor
+
+#define MOTOR_1 2 // Motor pins
+#define MOTOR_2 3
+#define MOTOR_3 6
+#define MOTOR_4 13
+
+#define LED1_PIN 22 // Led pins
+#define LED2_PIN 21
+#define LED3_PIN 20
+
+#define Calibration_PIN 9 // SW0
+#define Dispense_PIN 8  // SW1
+#define SW2_PIN 7
+
+#define PWM_CLOCKDIV 125
+#define PWM_WRAP 999
+
+volatile bool LedTimerTriggered = false;
+bool timer_callback(repeating_timer_t *rt) {
+    LedTimerTriggered = true;
+    return true; // keeps repeating
 }
 
-// Function to clear UART input buffer
-void clear_uart_buffer() {
-    while (uart_is_readable(uart0)) {
-        uart_getc(uart0);  // Read and discard any old data in the UART buffer
+const uint MOTOR_PINS[] = {MOTOR_1, MOTOR_2, MOTOR_3, MOTOR_4};
+
+// Sequence for half-step
+const int step_sequence[8][4] = {
+        {1, 0, 0, 0},
+        {1, 1, 0, 0},
+        {0, 1, 0, 0},
+        {0, 1, 1, 0},
+        {0, 0, 1, 0},
+        {0, 0, 1, 1},
+        {0, 0, 0, 1},
+        {1, 0, 0, 1}
+};
+
+void stepMotor(int step) {
+    for (int pin = 0; pin < 4; ++pin) {
+        gpio_put(MOTOR_PINS[pin], step_sequence[step][pin]);
     }
 }
 
-// Function to receive a response from the LoRa module
-bool receive_lora_response(char *buffer, int max_len, uint32_t timeout_ms) {
-    int pos = 0;
-    absolute_time_t start_time = get_absolute_time();  // Start timeout timer
+static int GlobalMotorStep_count = 0;
+void runMotor(int fraction, int averageSteps) {
+    int stepsToRun = (averageSteps / 8)*fraction;
+    int target_step_count = GlobalMotorStep_count + stepsToRun;
 
-    while (true) {
-        if (uart_is_readable(uart0)) {
-            char c = uart_getc(uart0);
-            if (c == '\r' || c == '\n') {
-                if (pos > 0) {
-                    buffer[pos] = '\0';  // Null-terminate string
-                    printf("Received: %s\n", buffer);
-                    return true;  // Return true if a complete response is received
-                }
-            } else {
-                if (pos < max_len - 1) {
-                    buffer[pos++] = c;  // Store character
-                }
-            }
-        }
-
-        // Check if response timeout has occurred
-        if (absolute_time_diff_us(start_time, get_absolute_time()) / 1000 > timeout_ms) {
-            if (pos > 0) {
-                buffer[pos] = '\0';
-                printf("Received (partial): %s\n", buffer);
-            } else {
-                printf("No response received within timeout\n");
-            }
-            return false;  // Timeout occurred, return false
-        }
+    for (; GlobalMotorStep_count < target_step_count; GlobalMotorStep_count++) {
+        stepMotor(GlobalMotorStep_count % 8);
+        sleep_ms(2);
     }
 }
-// Function to get the DevEui (EUID) and process it
-bool get_deveui(char *deveui) {
-    send_lora_command("AT+ID=DevEui");
-    char buffer[STRLEN];
-    if (receive_lora_response(buffer, STRLEN, RESPONSE_TIMEOUT_MS)) {
-        // The response might look like: "+ID: DevEui, 2C:F7:F1:20:42:00:34:09"
-        // We need to skip "+ID: DevEui," and remove the colons
-        if (strncmp(buffer, "+ID: DevEui,", 12) == 0) {
-            // Start parsing from after the comma (skip 12 characters)
-            int j = 0;
-            for (int i = 12; buffer[i] != '\0'; i++) {
-                if (buffer[i] == ':') {
-                    continue;  // Skip colons
-                }
-                // Convert to lowercase and store it in the deveui array
-                deveui[j++] = tolower(buffer[i]);
-            }
-            deveui[j] = '\0';  // Null-terminate DevEui
-            printf("DevEui: %s\n", deveui);
-            return true;
-        } else {
-            printf("Error: Unexpected response for DevEui: %s\n", buffer);
-        }
+
+// Interrupt handler for optical and piezo sensor
+volatile bool optopinTriggered = false;
+volatile bool pillDispensed = false;
+void generic_irq_callback(uint gpio, uint32_t event_mask){
+    if (gpio == OPTO_PIN) {
+        optopinTriggered = true;
     }
-    return false;
+    if (gpio == PIEZO_PIN) {
+        pillDispensed = true;
+    }
 }
 
-
-// Function to get the firmware version
-bool get_firmware_version() {
-    clear_uart_buffer();
-    send_lora_command("AT+VER");  // Correct command to get the firmware version
-    char buffer[STRLEN];
-    if (receive_lora_response(buffer, STRLEN, RESPONSE_TIMEOUT_MS)) {
-        // The response should look like: "+VER: 4.0.11"
-        // We need to check for the "+VER:" prefix
-        if (strncmp(buffer, "+VER:", 5) == 0) {
-            printf("Firmware Version: %s\n", buffer + 5);  // Skip "+VER:" prefix
-            return true;
-        } else {
-            printf("Error: Unexpected response for version: %s\n", buffer);
-        }
-    } else {
-        printf("No response for firmware version\n");
-    }
-    return false;
-}
-
-
-// Main program loop
+// Main program
 int main() {
-    const uint led_pin = 22;  // LED Pin
-    const uint button_pin = 9;    // Button Pin (SW_0)
+    gpio_init(OPTO_PIN);
+    gpio_set_dir(OPTO_PIN, GPIO_IN);
+    gpio_pull_up(OPTO_PIN);
 
-    // Initialize LED pin
-    gpio_init(led_pin);
-    gpio_set_dir(led_pin, GPIO_OUT);
+    gpio_init(PIEZO_PIN);
+    gpio_set_dir(PIEZO_PIN, GPIO_IN);
+    gpio_pull_up(PIEZO_PIN);
 
-    // Initialize Button pin
-    gpio_init(button_pin);
-    gpio_set_dir(button_pin, GPIO_IN);
-    gpio_pull_up(button_pin);  // Pull-up to ensure it reads correctly when pressed
+    //Initializing stepper motor pins
+    gpio_init(MOTOR_1);
+    gpio_set_dir(MOTOR_1, GPIO_OUT);
+    gpio_init(MOTOR_2);
+    gpio_set_dir(MOTOR_2, GPIO_OUT);
+    gpio_init(MOTOR_3);
+    gpio_set_dir(MOTOR_3, GPIO_OUT);
+    gpio_init(MOTOR_4);
+    gpio_set_dir(MOTOR_4, GPIO_OUT);
 
-    // Initialize UART0
+    //Initializing LED1 pin
+    gpio_init(LED1_PIN);
+    gpio_set_function(LED1_PIN, GPIO_FUNC_PWM);
+    gpio_set_dir(LED1_PIN, GPIO_OUT);
+
+    //Initializing LED2 pin
+    gpio_init(LED2_PIN);
+    gpio_set_function(LED2_PIN, GPIO_FUNC_PWM);
+    gpio_set_dir(LED2_PIN, GPIO_OUT);
+
+    //Initializing LED3 pin
+    gpio_init(LED3_PIN);
+    gpio_set_function(LED3_PIN, GPIO_FUNC_PWM);
+    gpio_set_dir(LED3_PIN, GPIO_OUT);
+
+    //Initializing button pins
+    gpio_init(Calibration_PIN);
+    gpio_set_dir(Calibration_PIN, GPIO_IN);
+    gpio_init(Dispense_PIN);
+    gpio_set_dir(Dispense_PIN, GPIO_IN);
+    gpio_init(SW2_PIN);
+    gpio_set_dir(SW2_PIN, GPIO_IN);
+    gpio_pull_up(Calibration_PIN);
+    gpio_pull_up(Dispense_PIN);
+    gpio_pull_up(SW2_PIN);
+
+
+    // Interrupts
+    gpio_set_irq_enabled_with_callback(OPTO_PIN, GPIO_IRQ_EDGE_FALL, true, &generic_irq_callback);
+    gpio_set_irq_enabled(OPTO_PIN, GPIO_IRQ_EDGE_FALL, true);
+    gpio_set_irq_enabled(PIEZO_PIN, GPIO_IRQ_EDGE_FALL, true);
+    gpio_set_irq_callback(&generic_irq_callback);
+
     stdio_init_all();
-    uart_init(uart0, BAUD_RATE);
 
-    // Configure TX and RX pins
-    gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
-    gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
+    // Create the timer
+    repeating_timer_t timer;
 
-    // Main loop
-    while (true) {
-        // Wait for the button press (SW_0)
-        if (!gpio_get(button_pin)) {
-            while (!gpio_get(button_pin)) { sleep_ms(500); }  // Wait for button release
+    // Negative timeout means exact delay (rather than delay between callbacks)
+    if (!add_repeating_timer_us(-500000, timer_callback, NULL, &timer)) {
+        printf("Timer failed.\n");
+        return 1;
+    }
+    printf("Booting...");
 
-            bool connected = false;
-            int attempts = 0;
-            char buffer[STRLEN];
+    //Config PWM for LED1
+    uint led1PwnChannel = pwm_gpio_to_channel(LED1_PIN);
+    uint led1PwnSlice = pwm_gpio_to_slice_num(LED1_PIN);
+    pwm_set_enabled(led1PwnSlice, false);
+    pwm_config config_led1 = pwm_get_default_config();
+    pwm_config_set_wrap(&config_led1, PWM_WRAP);
+    pwm_config_set_clkdiv(&config_led1, PWM_CLOCKDIV);
+    pwm_init(led1PwnSlice, &config_led1, false);
+    pwm_set_chan_level(led1PwnSlice, led1PwnChannel, 0);
+    gpio_set_function(LED1_PIN, GPIO_FUNC_PWM);
+    pwm_set_enabled(led1PwnSlice, true);
 
-            // Step 1: Send "AT" and verify response
-            while (attempts < MAX_ATTEMPTS && !connected) {
-                clear_uart_buffer();  // Clear any previous responses in the UART buffer
-                send_lora_command("AT");
-                if (receive_lora_response(buffer, STRLEN, RESPONSE_TIMEOUT_MS) && strstr(buffer, "+AT: OK") != NULL) {
-                    connected = true;
-                    printf("Connected to LoRa module\n");
-                } else {
-                    attempts++;
-                    printf("Attempt %d failed. Retrying...\n", attempts);
+    //Config PWM for LED2
+    uint led2PwnChannel = pwm_gpio_to_channel(LED2_PIN);
+    uint led2PwnSlice = pwm_gpio_to_slice_num(LED2_PIN);
+    pwm_set_enabled(led2PwnSlice, false);
+    pwm_config config_led2 = pwm_get_default_config();
+    pwm_config_set_wrap(&config_led2, PWM_WRAP);
+    pwm_config_set_clkdiv(&config_led2, PWM_CLOCKDIV);
+    pwm_init(led2PwnSlice, &config_led2, false);
+    pwm_set_chan_level(led2PwnSlice, led2PwnChannel, 0);
+    gpio_set_function(LED2_PIN, GPIO_FUNC_PWM);
+    pwm_set_enabled(led2PwnSlice, true);
+
+    //Config PWM for LED3
+    uint led3PwnChannel = pwm_gpio_to_channel(LED3_PIN);
+    uint led3PwnSlice = pwm_gpio_to_slice_num(LED3_PIN);
+    pwm_set_enabled(led3PwnSlice, false);
+    pwm_config config_led3 = pwm_get_default_config();
+    pwm_config_set_wrap(&config_led3, PWM_WRAP);
+    pwm_config_set_clkdiv(&config_led3, PWM_CLOCKDIV);
+    pwm_init(led3PwnSlice, &config_led3, false);
+    pwm_set_chan_level(led3PwnSlice, led3PwnChannel, 0);
+    gpio_set_function(LED3_PIN, GPIO_FUNC_PWM);
+    pwm_set_enabled(led3PwnSlice, true);
+
+    bool isCalibrated = false;
+    int pillsDispensed_count = 0;
+    int turnsCount = 0;
+    int step_index = 0;
+    int step_count = 0;
+    float averageSteps = 0;
+    int CalibMeasurements[3];
+    int ledState = 0;
+
+    while (1){
+        // Blink LED1 while waiting
+        if (LedTimerTriggered) {
+            if (isCalibrated == false) {
+                // If not calibrated, Led blinks slowly
+                pwm_set_chan_level(led1PwnSlice, led1PwnChannel, ledState);
+                ledState = ledState ? 0 : 100;
+            } else {
+                // If calibrated, led blinks faster
+                pwm_set_chan_level(led1PwnSlice, led1PwnChannel, ledState);
+                ledState = ledState ? 0 : 100; // Other possible Led state
+            }
+            LedTimerTriggered = false;
+        }
+
+
+        // Calibrating
+        // SW0 button to start calibrating
+        if (!gpio_get(Calibration_PIN)) {
+            while (!gpio_get(Calibration_PIN)) {
+                sleep_ms(50);
+            }
+            printf("Calibration starting...\n");
+            pwm_set_chan_level(led1PwnSlice, led1PwnChannel, 0);
+            while (isCalibrated == false) {
+                while (optopinTriggered == false) {
+                    stepMotor(step_index % 8);
+                    step_index++;
+                    sleep_ms(2);
                 }
-            }
+                printf("Optical sensor has been found.\n");
+                optopinTriggered = false;
 
-            if (!connected) {
-                printf("Module not responding\n");
-                continue;  // Go back to waiting for button press
-            }
+                // Turns 3 times to calibrate motor
+                for (int i = 0; i < 3; i++) {
+                    optopinTriggered = false;
+                    step_count = 0;
+                    while (optopinTriggered == false) {
+                        stepMotor(step_index % 8);
+                        step_index++;
+                        step_count++;
+                        sleep_ms(2);
+                    }
+                    CalibMeasurements[i] = step_count;
+                }
 
-            // Add a larger delay between commands to allow the module to reset/settle
-            sleep_ms(COMMAND_DELAY_MS);
-
-            // Step 2: Get firmware version after AT command
-            if (!get_firmware_version()) {
-                printf("Module stopped responding\n");
-                continue;  // Go back to waiting for button press
-            }
-
-            // Add a larger delay between commands to ensure the module can process next command
-            sleep_ms(COMMAND_DELAY_MS);
-
-            // Step 3: Get DevEui (after AT+VER)
-            char deveui[17];  // DevEui is 16 characters in hexadecimal
-            if (!get_deveui(deveui)) {
-                printf("Module stopped responding\n");
-                continue;  // Go back to waiting for button press
+                // Calculate avg steps per revolution
+                averageSteps = (CalibMeasurements[0] + CalibMeasurements[1] + CalibMeasurements[2]) / 3;
+                isCalibrated = true;
+                printf("Average steps: %.2f\n", averageSteps);
+                printf("1. Steps: %d\n", CalibMeasurements[0]);
+                printf("2. Steps: %d\n", CalibMeasurements[1]);
+                printf("3. Steps: %d\n", CalibMeasurements[2]);
             }
         }
+
+        // Dispensing all pill slots
+        // SW1 button to starts to dispense pills
+        if (!gpio_get(Dispense_PIN)) {
+            while (!gpio_get(Dispense_PIN)) {
+                sleep_ms(50);
+            }
+            // Turns LED1 off
+            if (LedTimerTriggered) {
+                pwm_set_chan_level(led1PwnSlice, led1PwnChannel, 0);
+            }
+            if(isCalibrated != true) {
+                printf("Calibration is not ready. Press SW0\n");
+                continue;
+            }
+            pillDispensed = false;
+            while (turnsCount < 7){
+                runMotor(1, averageSteps);
+                sleep_ms(80);
+                if (pillDispensed == true) {
+                    pillsDispensed_count++;
+                    pillDispensed = false;
+                    printf("Pill dispensed\n");
+                } else if (pillDispensed == false) {
+                    // Blink LED1 5 times if no pills detected
+                    for (int i = 0; i <= 5; i++) {
+                        pwm_set_chan_level(led1PwnSlice, led1PwnChannel, 100);
+                        sleep_ms(100);
+                        pwm_set_chan_level(led1PwnSlice, led1PwnChannel, 0);
+                        sleep_ms(100);
+                    }
+                    printf("No dispense detected\n");
+                }
+                turnsCount++;
+            }
+            printf("Number of pills dispensed: %d\n", pillsDispensed_count);
+            turnsCount = 0;
+            pillsDispensed_count = 0;
+
+            isCalibrated = false;
+        }
     }
-    return 0;
+    cancel_repeating_timer(&timer);
 }
