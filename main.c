@@ -9,9 +9,7 @@
 #include <ctype.h>
 #include <stdlib.h>
 
-// TODO: Led blinks while waiting in all possible states (waiting room)
-// Check if leds really blinks 5 times (pill dispense)
-// TODO+ Device remembers state even if reset
+// TODO+ Device remembers state even if reset EEPROM
 // Device connected to Lorawan and sends logs when status is changed
 
 #define OPTO_PIN 28 // Optical sensor pin
@@ -29,6 +27,9 @@
 #define Calibration_PIN 9 // SW0
 #define Dispense_PIN 8  // SW1
 #define SW2_PIN 7
+
+#define SDA_PIN 16
+#define SCL_PIN 17
 
 #define PWM_CLOCKDIV 125
 #define PWM_WRAP 999
@@ -137,10 +138,10 @@ int main() {
 
     stdio_init_all();
 
-    // Create the timer
+    // Creates timer
     repeating_timer_t timer;
 
-    // Negative timeout means exact delay (rather than delay between callbacks)
+    // Negative timeout means exact delay
     if (!add_repeating_timer_us(-500000, timer_callback, NULL, &timer)) {
         printf("Timer failed.\n");
         return 1;
@@ -192,102 +193,142 @@ int main() {
     int CalibMeasurements[3];
     int ledState = 0;
 
-    while (1){
-        // Blink LED1 while waiting
-        if (LedTimerTriggered) {
-            if (isCalibrated == false) {
-                // If not calibrated, Led blinks slowly
-                pwm_set_chan_level(led1PwnSlice, led1PwnChannel, ledState);
-                ledState = ledState ? 0 : 100;
-            } else {
-                // If calibrated, led blinks faster
-                pwm_set_chan_level(led1PwnSlice, led1PwnChannel, ledState);
-                ledState = ledState ? 0 : 100; // Other possible Led state
-            }
-            LedTimerTriggered = false;
+
+while (1) {
+    // Blink LED1 while waiting
+    if (LedTimerTriggered) {
+        if (!isCalibrated) {
+            // If not calibrated, Led blinks slowly
+            pwm_set_chan_level(led1PwnSlice, led1PwnChannel, ledState);
+            ledState = ledState ? 0 : 100;
+        } else {
+            // If calibrated, led blinks faster
+            pwm_set_chan_level(led1PwnSlice, led1PwnChannel, ledState);
+            ledState = ledState ? 0 : 100; // Other possible Led state
+        }
+        LedTimerTriggered = false;
+    }
+
+    // Calibrating
+    // SW0 button to start calibrating
+    if (!gpio_get(Calibration_PIN))
+    {
+        while (!gpio_get(Calibration_PIN)) {
+            sleep_ms(50);
         }
 
+        // Check if already calibrated and average steps are valid
+        if (isCalibrated && averageSteps > 4090) {
+            printf("System is already calibrated. Average steps: %g\n", averageSteps);
+            continue; // Skip calibration if already calibrated
+        }
+        printf("Calibration starting...\n");
+        pwm_set_chan_level(led1PwnSlice, led1PwnChannel, 0);
+        isCalibrated = false; // Reset to false at the start of calibration
 
-        // Calibrating
-        // SW0 button to start calibrating
-        if (!gpio_get(Calibration_PIN)) {
-            while (!gpio_get(Calibration_PIN)) {
-                sleep_ms(50);
+        // Initialize CalibMeasurements to a known state
+        memset(CalibMeasurements, 0, sizeof(CalibMeasurements));
+
+        while (!isCalibrated) {
+            // Find reference point using optical sensor
+            while (!optopinTriggered) {
+                stepMotor(step_index % 8);
+                step_index++;
+                sleep_ms(2);
             }
-            printf("Calibration starting...\n");
-            pwm_set_chan_level(led1PwnSlice, led1PwnChannel, 0);
-            while (isCalibrated == false) {
-                while (optopinTriggered == false) {
+            printf("Optical sensor has been found. Reference position.\n");
+            optopinTriggered = false;
+
+            // Turns 3 times to calibrate motor
+            int validCount = 0; // Count of valid measurements
+            int totalSteps = 0; // Total of valid steps
+            for (int i = 0; i < 3; i++) {
+                optopinTriggered = false;
+                step_count = 0;
+                while (!optopinTriggered) {
                     stepMotor(step_index % 8);
                     step_index++;
+                    step_count++;
                     sleep_ms(2);
                 }
-                printf("Optical sensor has been found.\n");
-                optopinTriggered = false;
-
-                // Turns 3 times to calibrate motor
-                for (int i = 0; i < 3; i++) {
-                    optopinTriggered = false;
-                    step_count = 0;
-                    while (optopinTriggered == false) {
-                        stepMotor(step_index % 8);
-                        step_index++;
-                        step_count++;
-                        sleep_ms(2);
+                if (step_count >= 4095) { // Check if step count is valid
+                    if (validCount < 3) { // Array bound
+                        CalibMeasurements[validCount] = step_count;
+                        totalSteps += step_count;
+                        validCount++;
+                    } else {
+                        printf("Max valid measurement reached.\n");
                     }
-                    CalibMeasurements[i] = step_count;
+                } else {
+                    printf("Step count %d is below threshold and will not be used.\n", step_count);
                 }
+            }
 
-                // Calculate avg steps per revolution
-                averageSteps = (CalibMeasurements[0] + CalibMeasurements[1] + CalibMeasurements[2]) / 3;
-                isCalibrated = true;
-                printf("Average steps: %.2f\n", averageSteps);
-                printf("1. Steps: %d\n", CalibMeasurements[0]);
-                printf("2. Steps: %d\n", CalibMeasurements[1]);
-                printf("3. Steps: %d\n", CalibMeasurements[2]);
+            // Calculate avg steps per revolution if valid measurements exist
+            if (validCount > 0) {
+                averageSteps = totalSteps / validCount; // Calculate the avg of valid steps
+                printf("Average steps: %g\n", averageSteps);
+            } else {
+                averageSteps = 0; // If no valid measurements, set avg default 0
+                printf("No valid measurements found for average calculation.\n");
             }
-        }
 
-        // Dispensing all pill slots
-        // SW1 button to starts to dispense pills
-        if (!gpio_get(Dispense_PIN)) {
-            while (!gpio_get(Dispense_PIN)) {
-                sleep_ms(50);
+            // Prints valid measurements
+            for (int j = 0; j < validCount; j++) {
+                printf("%d. Steps: %d\n", j + 1, CalibMeasurements[j]);
             }
-            // Turns LED1 off
-            if (LedTimerTriggered) {
-                pwm_set_chan_level(led1PwnSlice, led1PwnChannel, 0);
-            }
-            if(isCalibrated != true) {
-                printf("Calibration is not ready. Press SW0\n");
-                continue;
-            }
-            pillDispensed = false;
-            while (turnsCount < 7){
-                runMotor(1, averageSteps);
-                sleep_ms(80);
-                if (pillDispensed == true) {
-                    pillsDispensed_count++;
-                    pillDispensed = false;
-                    printf("Pill dispensed\n");
-                } else if (pillDispensed == false) {
-                    // Blink LED1 5 times if no pills detected
-                    for (int i = 0; i <= 5; i++) {
-                        pwm_set_chan_level(led1PwnSlice, led1PwnChannel, 100);
-                        sleep_ms(100);
-                        pwm_set_chan_level(led1PwnSlice, led1PwnChannel, 0);
-                        sleep_ms(100);
-                    }
-                    printf("No dispense detected\n");
-                }
-                turnsCount++;
-            }
-            printf("Number of pills dispensed: %d\n", pillsDispensed_count);
-            turnsCount = 0;
-            pillsDispensed_count = 0;
 
-            isCalibrated = false;
+            // Align motor with first slot (slot alignment)
+            for (int step = 0; step < 166; step++) {
+                stepMotor(step % 8);
+                sleep_ms(5);
+                step_index++;
+            }
+            printf("Dispenser is aligned...\n");
+
+            isCalibrated = true; // Calibration success
         }
     }
+
+    // Dispensing pill slots
+    // SW1 button to start dispensing pills
+    if (!gpio_get(Dispense_PIN)) {
+        while (!gpio_get(Dispense_PIN)) {
+            sleep_ms(50);
+        }
+        // Turns LED1 off
+        if (LedTimerTriggered) {
+            pwm_set_chan_level(led1PwnSlice, led1PwnChannel, 0);
+        }
+        // Checks if device is calibrated
+        if (!isCalibrated) {
+            printf("Calibration is not ready. Press SW0\n");
+            continue; // Skips dispensing if not calibrated
+        }
+        pillDispensed = false;
+        while (turnsCount < 8) {
+            runMotor(1, averageSteps);
+            sleep_ms(80);
+            if (pillDispensed) {
+                pillsDispensed_count++;
+                pillDispensed = false;
+                printf("Pill dispensed\n");
+            } else {
+                // Blink LED1 5 times if no pills detected
+                for (int i = 0; i <= 5; i++) {
+                    pwm_set_chan_level(led1PwnSlice, led1PwnChannel, 100);
+                    sleep_ms(100);
+                    pwm_set_chan_level(led1PwnSlice, led1PwnChannel, 0);
+                    sleep_ms(100);
+                }
+                printf("No dispense detected\n");
+            }
+            turnsCount++;
+        }
+        printf("Number of pills dispensed: %d\n", pillsDispensed_count);
+        turnsCount = 0;
+        pillsDispensed_count = 0;
+    }
+}
     cancel_repeating_timer(&timer);
 }
