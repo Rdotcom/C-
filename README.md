@@ -4,4 +4,4 @@
 
 Pill dispenser contains a stepper motor for turning motor, piezo electric sensor for detecting pill drops and optical sensor is for calibrating the wheel.
 LoraWAN module is communicator to the server.
-I2C EEPROM works for storage unit.
+I2C EEPROM works as device storage.
